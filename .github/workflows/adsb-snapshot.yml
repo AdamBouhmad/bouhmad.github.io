@@ -24,6 +24,7 @@ jobs:
           curl --fail --show-error --max-time 60 \
             'https://opendata.adsb.fi/api/v3/lat/47.6062/lon/-122.3321/dist/80' \
             -o /tmp/adsb.json
+          mkdir -p public
           python3 - <<'PY'
           import json, datetime
           raw = json.load(open('/tmp/adsb.json'))
