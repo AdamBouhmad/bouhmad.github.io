@@ -3,7 +3,9 @@ name: ADS-B snapshot
 # public snapshot the map reads CORS-open from raw.githubusercontent.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # Offset from :00/:05 — GitHub sheds load by dropping schedules that fire
+    # on the crowded round minutes, which left this cron never running.
+    - cron: "2-57/5 * * * *"
   workflow_dispatch:
 
 concurrency:
