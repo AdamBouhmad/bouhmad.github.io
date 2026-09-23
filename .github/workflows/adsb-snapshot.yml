@@ -21,26 +21,30 @@ jobs:
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch Seattle airspace
+      - name: Fetch Seattle + Baltimore airspace
         run: |
           curl --fail --show-error --max-time 60 \
             'https://opendata.adsb.fi/api/v3/lat/47.6062/lon/-122.3321/dist/80' \
-            -o /tmp/adsb.json
+            -o /tmp/adsb-seattle.json
+          curl --fail --show-error --max-time 60 \
+            'https://opendata.adsb.fi/api/v3/lat/39.2904/lon/-76.6122/dist/80' \
+            -o /tmp/adsb-baltimore.json
           mkdir -p public
           python3 - <<'PY'
           import json, datetime
-          raw = json.load(open('/tmp/adsb.json'))
-          snap = {
-            "fetchedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "source": "adsb.fi",
-            "ac": raw.get("ac", []),
-          }
-          json.dump(snap, open('public/adsb-snapshot.json', 'w'))
-          print(f"snapshot: {len(snap['ac'])} aircraft")
+          for city, path in [("seattle", "public/adsb-snapshot.json"), ("baltimore", "public/adsb-snapshot-baltimore.json")]:
+              raw = json.load(open(f'/tmp/adsb-{city}.json'))
+              snap = {
+                "fetchedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "source": "adsb.fi",
+                "ac": raw.get("ac", []),
+              }
+              json.dump(snap, open(path, 'w'))
+              print(f"{city}: {len(snap['ac'])} aircraft")
           PY
       - name: Commit if changed
         run: |
           git config user.name "seattle-ops-bot"
           git config user.email "seattle-ops-bot@users.noreply.github.com"
-          git add public/adsb-snapshot.json
+          git add public/adsb-snapshot.json public/adsb-snapshot-baltimore.json
           git diff --cached --quiet && echo "no change" || (git commit -m "ADS-B snapshot $(date -u +%H:%M)" && git pull --rebase --autostash origin ${GITHUB_REF_NAME} && git push)
