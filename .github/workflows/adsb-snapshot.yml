@@ -18,33 +18,101 @@ permissions:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch Seattle + Baltimore airspace
+      - name: Fetch airspace for every city
         run: |
-          curl --fail --show-error --max-time 60 \
-            'https://opendata.adsb.fi/api/v3/lat/47.6062/lon/-122.3321/dist/80' \
-            -o /tmp/adsb-seattle.json
-          curl --fail --show-error --max-time 60 \
-            'https://opendata.adsb.fi/api/v3/lat/39.2904/lon/-76.6122/dist/80' \
-            -o /tmp/adsb-baltimore.json
           mkdir -p public
           python3 - <<'PY'
-          import json, datetime
-          for city, path in [("seattle", "public/adsb-snapshot.json"), ("baltimore", "public/adsb-snapshot-baltimore.json")]:
-              raw = json.load(open(f'/tmp/adsb-{city}.json'))
+          import json, datetime, urllib.request, time
+          # id -> (lat, lon, snapshot path); Seattle keeps its legacy filename.
+          CITIES = {
+            "seattle":   (47.6062, -122.3321, "public/adsb-snapshot.json"),
+            "baltimore": (39.2904, -76.6122,  "public/adsb-snapshot-baltimore.json"),
+            "sf":        (37.7749, -122.4194, "public/adsb-snapshot-sf.json"),
+            "nyc":       (40.7484, -73.9857,  "public/adsb-snapshot-nyc.json"),
+            "chicago":   (41.8781, -87.6298,  "public/adsb-snapshot-chicago.json"),
+            "charlotte": (35.2271, -80.8431,  "public/adsb-snapshot-charlotte.json"),
+            "portland":  (45.5231, -122.6765, "public/adsb-snapshot-portland.json"),
+            "dallas":    (32.7767, -96.7970,  "public/adsb-snapshot-dallas.json"),
+          }
+          for city, (lat, lon, path) in CITIES.items():
+              try:
+                  with urllib.request.urlopen(
+                      f"https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}/dist/80", timeout=60
+                  ) as r:
+                      raw = json.load(r)
+              except Exception as e:
+                  # One city failing must not lose the others' snapshots.
+                  print(f"{city}: FAILED ({e}) — keeping previous snapshot")
+                  continue
               snap = {
-                "fetchedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "source": "adsb.fi",
-                "ac": raw.get("ac", []),
+                  "fetchedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  "source": "adsb.fi",
+                  "ac": raw.get("ac", []),
               }
-              json.dump(snap, open(path, 'w'))
+              json.dump(snap, open(path, "w"))
               print(f"{city}: {len(snap['ac'])} aircraft")
+              time.sleep(2)  # polite spacing for adsb.fi
           PY
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Listen to AIS for both harbors
+        env:
+          AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
+        run: |
+          node --input-type=module - <<'JS'
+          // aisstream.io silently blackholes Cloudflare egress (socket accepts,
+          // zero frames) — GitHub's Azure egress works, so this runner owns the
+          // key's single upstream socket and publishes a vessel snapshot the
+          // worker's collector DO merges. Boxes mirror shared/city.js (untracked).
+          import { writeFileSync } from "node:fs";
+          const key = process.env.AISSTREAM_API_KEY;
+          if (!key) { console.log("AISSTREAM_API_KEY not set; skipping"); process.exit(0); }
+          const REGIONS = [
+            { region: "seattle", box: [[47.52, -122.48], [47.76, -122.18]] },
+            { region: "baltimore", box: [[39.15, -76.75], [39.32, -76.38]] },
+          ];
+          const regionOf = (lat, lon) => REGIONS.find(r => lat >= r.box[0][0] && lat <= r.box[1][0] && lon >= r.box[0][1] && lon <= r.box[1][1])?.region ?? "other";
+          const vessels = new Map(), names = new Map();
+          const ws = new WebSocket("wss://stream.aisstream.io/v0/stream");
+          ws.onopen = () => ws.send(JSON.stringify({ APIKey: key, BoundingBoxes: REGIONS.map(r => r.box), FilterMessageTypes: ["PositionReport", "ShipStaticData"] }));
+          ws.onmessage = async (e) => {
+            try {
+              const msg = JSON.parse(typeof e.data === "string" ? e.data : await e.data.text());
+              const meta = msg.MetaData ?? {}, mmsi = String(meta.MMSI ?? "");
+              if (!mmsi) return;
+              const metaName = (meta.ShipName ?? "").trim();
+              if (metaName) names.set(mmsi, metaName);
+              const prev = vessels.get(mmsi) ?? {};
+              if (msg.MessageType === "PositionReport") {
+                const pr = msg.Message?.PositionReport ?? {}, lat = meta.latitude, lon = meta.longitude;
+                if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+                vessels.set(mmsi, { ...prev, mmsi, latitude: lat, longitude: lon,
+                  heading: pr.TrueHeading !== 511 ? pr.TrueHeading : prev.heading ?? null,
+                  cog: pr.Cog ?? prev.cog ?? null, speed: pr.Sog ?? prev.speed ?? 0,
+                  name: names.get(mmsi) || prev.name || null, region: regionOf(lat, lon), timestamp: Date.now() });
+              } else if (msg.MessageType === "ShipStaticData") {
+                const sd = msg.Message?.ShipStaticData ?? {};
+                const name = (sd.Name ?? "").trim() || metaName;
+                vessels.set(mmsi, { ...prev, mmsi, name: name || prev.name || null,
+                  shipType: sd.Type ?? prev.shipType ?? 0, callsign: (sd.CallSign ?? "").trim() || prev.callsign || null,
+                  latitude: prev.latitude, longitude: prev.longitude, region: prev.region, timestamp: prev.timestamp ?? Date.now() });
+              }
+            } catch {}
+          };
+          setTimeout(() => {
+            const list = [...vessels.values()].filter(v => Number.isFinite(v.latitude));
+            writeFileSync("public/ais-snapshot.json", JSON.stringify({ fetchedAt: new Date().toISOString(), source: "aisstream.io", vessels: list }));
+            console.log(`ais: ${list.length} vessels (${list.filter(v => v.region === "seattle").length} seattle, ${list.filter(v => v.region === "baltimore").length} baltimore)`);
+            process.exit(0);
+          }, 90000);
+          JS
       - name: Commit if changed
         run: |
           git config user.name "seattle-ops-bot"
           git config user.email "seattle-ops-bot@users.noreply.github.com"
-          git add public/adsb-snapshot.json public/adsb-snapshot-baltimore.json
-          git diff --cached --quiet && echo "no change" || (git commit -m "ADS-B snapshot $(date -u +%H:%M)" && git pull --rebase --autostash origin ${GITHUB_REF_NAME} && git push)
+          git add public/adsb-snapshot*.json public/ais-snapshot.json 2>/dev/null || git add public/adsb-snapshot*.json
+          git diff --cached --quiet && echo "no change" || (git commit -m "Airspace + harbor snapshot $(date -u +%H:%M)" && git pull --rebase --autostash origin ${GITHUB_REF_NAME} && git push)
